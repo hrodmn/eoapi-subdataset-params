@@ -2,22 +2,27 @@
 
 import logging
 import re
+import urllib.parse
 from contextlib import asynccontextmanager
-from typing import Dict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Type
 
+import attr
 import jinja2
 import pystac
 from eoapi.raster import __version__ as eoapi_raster_version
 from eoapi.raster.config import ApiSettings
-from fastapi import Depends, FastAPI, Query
+from fastapi import Depends, FastAPI, Path, Query
 from psycopg import OperationalError
 from psycopg.rows import dict_row
 from psycopg_pool import PoolTimeout
+from rio_tiler.io import BaseReader, Reader
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse
 from starlette.templating import Jinja2Templates
 from starlette_cramjam.middleware import CompressionMiddleware
+from titiler.core.dependencies import DefaultDependency
 from titiler.core.errors import DEFAULT_STATUS_CODES, add_exception_handlers
 from titiler.core.factory import (
     AlgorithmFactory,
@@ -27,17 +32,23 @@ from titiler.core.factory import (
     TMSFactory,
 )
 from titiler.core.middleware import CacheControlMiddleware
-from titiler.extensions import cogViewerExtension
+from titiler.extensions.viewer import cogViewerExtension
 from titiler.mosaic.errors import MOSAIC_STATUS_CODES
+from titiler.pgstac import mosaic, reader
 from titiler.pgstac.db import close_db_connection, connect_to_db
-from titiler.pgstac.dependencies import CollectionIdParams, ItemIdParams, SearchIdParams
+from titiler.pgstac.dependencies import (
+    CollectionIdParams,
+    ItemIdParams,
+    SearchIdParams,
+    get_stac_item,
+)
 from titiler.pgstac.extensions import searchInfoExtension
 from titiler.pgstac.factory import (
     MosaicTilerFactory,
     add_search_list_route,
     add_search_register_route,
 )
-from titiler.pgstac.reader import PgSTACReader
+from typing_extensions import Annotated
 
 logging.getLogger("botocore.credentials").disabled = True
 logging.getLogger("botocore.utils").disabled = True
@@ -53,6 +64,76 @@ jinja2_env = jinja2.Environment(
     )
 )
 templates = Jinja2Templates(env=jinja2_env)
+
+
+@dataclass(init=False)
+class ReaderParams(DefaultDependency):
+    """reader parameters."""
+
+    reader_options: Dict = field(init=False)
+
+    def __init__(
+        self,
+        subdataset_name: Annotated[
+            Optional[str],
+            Query(
+                title="Subdataset name",
+                description="The name of a subdataset within the asset.",
+            ),
+        ] = None,
+        subdataset_bands: Annotated[
+            Optional[List[int]],
+            Query(
+                title="Subdataset bands",
+                description="The band index of a subdataset within the asset.",
+            ),
+        ] = None,
+    ):
+        """Initialize ReaderParams"""
+        params = {}
+        if subdataset_name:
+            params["subdataset_name"] = subdataset_name
+
+        if subdataset_bands:
+            params["subdataset_bands"] = subdataset_bands  # type: ignore
+
+        self.reader_options = params
+
+
+@attr.s
+class CustomReader(Reader):
+    subdataset_name: Optional[str] = attr.ib(default=None)
+    subdataset_bands: Optional[List[int]] = attr.ib(default=None)
+
+    def __attrs_post_init__(self):
+        vrt_params = {}
+        if self.subdataset_name:
+            vrt_params["sd_name"] = self.subdataset_name
+
+        if self.subdataset_bands:
+            vrt_params["bands"] = ",".join(
+                [str(band) for band in self.subdataset_bands]
+            )
+
+        if vrt_params:
+            params = urllib.parse.urlencode(vrt_params, safe=",")
+            self.input = f"vrt:///vsicurl/{self.input}?{params}"
+        super().__attrs_post_init__()
+
+
+@attr.s
+class PgSTACReader(reader.PgSTACReader):
+    reader: Type[BaseReader] = attr.ib(default=CustomReader)
+
+
+@attr.s
+class CustomSTACReader(mosaic.CustomSTACReader):
+    reader: Type[BaseReader] = attr.ib(default=CustomReader)
+
+
+@attr.s
+class PGSTACBackend(mosaic.PGSTACBackend):
+    reader: Type[BaseReader] = attr.ib(init=False, default=CustomSTACReader)
 
 
 @asynccontextmanager
@@ -117,6 +198,8 @@ async def list_collection(request: Request):
 ###############################################################################
 # STAC Search Endpoints
 searches = MosaicTilerFactory(
+    reader=PGSTACBackend,
+    reader_dependency=ReaderParams,
     path_dependency=SearchIdParams,
     router_prefix="/searches/{search_id}",
     add_statistics=True,
@@ -173,6 +256,8 @@ async def virtual_mosaic_builder(request: Request):
 ###############################################################################
 # STAC COLLECTION Endpoints
 collection = MosaicTilerFactory(
+    reader=PGSTACBackend,
+    reader_dependency=ReaderParams,
     path_dependency=CollectionIdParams,
     router_prefix="/collections/{collection_id}",
     add_statistics=True,
@@ -191,6 +276,7 @@ app.include_router(
 # STAC Item Endpoints
 stac = MultiBaseTilerFactory(
     reader=PgSTACReader,
+    reader_dependency=ReaderParams,
     path_dependency=ItemIdParams,
     router_prefix="/collections/{collection_id}/items/{item_id}",
     add_viewer=True,
@@ -224,6 +310,113 @@ app.include_router(
     prefix="/collections/{collection_id}/items/{item_id}",
 )
 
+
+def ItemAssetIdParams(
+    request: Request,
+    collection_id: Annotated[
+        str,
+        Path(description="STAC Collection Identifier"),
+    ],
+    item_id: Annotated[str, Path(description="STAC Item Identifier")],
+    asset_id: Annotated[str, Path(description="STAC Item Identifier")],
+    subdataset_name: Annotated[
+        Optional[str],
+        Query(
+            title="Subdataset name",
+            description="The name of a subdataset within the asset.",
+        ),
+    ] = None,
+    subdataset_bands: Annotated[
+        Optional[List[int]],
+        Query(
+            title="Subdataset bands",
+            description="The band index of a subdataset within the asset.",
+        ),
+    ] = None,
+):
+    """STAC Item Asset dependency."""
+    item = get_stac_item(request.app.state.dbpool, collection_id, item_id)
+    asset_info = item.assets[asset_id]
+    url = asset_info.get_absolute_href() or asset_info.href
+
+    vrt_params = {}
+    if subdataset_name:
+        vrt_params["sd_name"] = subdataset_name
+
+    if subdataset_bands:
+        vrt_params["bands"] = ",".join([str(band) for band in subdataset_bands])
+
+    if vrt_params:
+        params = urllib.parse.urlencode(vrt_params, safe=",")
+        url = f"vrt:///vsicurl/{url}?{params}"
+
+    return url
+
+
+###############################################################################
+# STAC Assets Endpoints
+assets = TilerFactory(
+    reader=Reader,
+    path_dependency=ItemAssetIdParams,
+    router_prefix="/collections/{collection_id}/items/{item_id}/assets/{asset_id}",
+)
+app.include_router(
+    assets.router,
+    tags=["STAC Asset"],
+    prefix="/collections/{collection_id}/items/{item_id}/assets/{asset_id}",
+)
+
+
+###############################################################################
+# External Dataset Endpoints
+def SdsParams(
+    url: Annotated[
+        str,
+        Query(
+            ...,
+            description="Dataset url",
+        ),
+    ],
+    subdataset_name: Annotated[
+        Optional[str],
+        Query(
+            title="Subdataset name",
+            description="The name of a subdataset within the asset.",
+        ),
+    ] = None,
+    subdataset_bands: Annotated[
+        Optional[List[int]],
+        Query(
+            title="Subdataset bands",
+            description="The band index of a subdataset within the asset.",
+        ),
+    ] = None,
+):
+    vrt_params = {}
+    if subdataset_name:
+        vrt_params["sd_name"] = subdataset_name
+
+    if subdataset_bands:
+        vrt_params["bands"] = ",".join([str(band) for band in subdataset_bands])
+
+    if vrt_params:
+        params = urllib.parse.urlencode(vrt_params, safe=",")
+        url = f"vrt:///vsicurl/{url}?{params}"
+
+    return url
+
+
+assets = TilerFactory(
+    reader=Reader,
+    path_dependency=SdsParams,
+    router_prefix="/dataset",
+)
+
+app.include_router(
+    assets.router,
+    tags=["External Dataset"],
+    prefix="/dataset",
+)
 
 ###############################################################################
 # COG Endpoints
